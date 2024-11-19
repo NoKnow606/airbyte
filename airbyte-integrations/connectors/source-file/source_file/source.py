@@ -1,8 +1,7 @@
 #
 # Copyright (c) 2022 Airbyte, Inc., all rights reserved.
 #
-
-
+import copy
 import json
 import logging
 import traceback
@@ -79,20 +78,33 @@ class SourceFile(Source):
 
         return client
 
-    def _validate_and_transform(self, config: Mapping[str, Any]):
-        if "reader_options" in config:
-            try:
-                config["reader_options"] = json.loads(config["reader_options"])
-            except ValueError:
-                raise ConfigurationError("reader_options is not valid JSON")
-        else:
-            config["reader_options"] = {}
-        config["url"] = dropbox_force_download(config["url"])
+    def _get_clients(self, config: Mapping):
+        clients = []
+        urls = config['url'].split(',')
+        for url in urls:
+            new_config = copy.deepcopy(config)
+            new_config['url'] = url
+            new_config['dataset_name'] = url.split('?')[0].split('/')[-1].split('.')[0]
+            clients.append(self.client_class(**new_config))
+        return clients
 
-        parse_result = urlparse(config["url"])
-        if parse_result.netloc == "docs.google.com" and parse_result.path.lower().startswith("/spreadsheets/"):
-            raise ConfigurationError(f'Failed to load {config["url"]}: please use the Official Google Sheets Source connector')
+    def _validate_and_transform(self, config: Mapping[str, Any]):
         return config
+        # if "reader_options" in config:
+        #     try:
+        #         config["reader_options"] = json.loads(config["reader_options"])
+        #     except ValueError:
+        #         raise ConfigurationError("reader_options is not valid JSON")
+        # else:
+        #     config["reader_options"] = {}
+        # urls = config["url"].split(',')
+        # for url in urls:
+        #     config["url"] = dropbox_force_download(url)
+        #
+        #     parse_result = urlparse(url)
+        #     if parse_result.netloc == "docs.google.com" and parse_result.path.lower().startswith("/spreadsheets/"):
+        #         raise ConfigurationError(f'Failed to load {url}: please use the Official Google Sheets Source connector')
+        # return config
 
     def check(self, logger, config: Mapping) -> AirbyteConnectionStatus:
         """
@@ -105,23 +117,24 @@ class SourceFile(Source):
             logger.error(str(e))
             return AirbyteConnectionStatus(status=Status.FAILED, message=str(e))
 
-        client = self._get_client(config)
-        source_url = client.reader.full_url
-        try:
-            with client.reader.open():
-                list(client.streams)
-                return AirbyteConnectionStatus(status=Status.SUCCEEDED)
-        except (TypeError, ValueError, ConfigurationError) as err:
-            reason = (
-                f"Failed to load {source_url}\n Please check File Format and Reader Options are set correctly"
-                f"\n{repr(err)}\n{traceback.format_exc()}"
-            )
-            logger.error(reason)
-            return AirbyteConnectionStatus(status=Status.FAILED, message=reason)
-        except Exception as err:
-            reason = f"Failed to load {source_url}: {repr(err)}\n{traceback.format_exc()}"
-            logger.error(reason)
-            return AirbyteConnectionStatus(status=Status.FAILED, message=reason)
+        clients = self._get_clients(config)
+        for client in clients:
+            source_url = client.reader.full_url
+            try:
+                with client.reader.open():
+                    list(client.streams)
+                    return AirbyteConnectionStatus(status=Status.SUCCEEDED)
+            except (TypeError, ValueError, ConfigurationError) as err:
+                reason = (
+                    f"Failed to load {source_url}\n Please check File Format and Reader Options are set correctly"
+                    f"\n{repr(err)}\n{traceback.format_exc()}"
+                )
+                logger.error(reason)
+                return AirbyteConnectionStatus(status=Status.FAILED, message=reason)
+            except Exception as err:
+                reason = f"Failed to load {source_url}: {repr(err)}\n{traceback.format_exc()}"
+                logger.error(reason)
+                return AirbyteConnectionStatus(status=Status.FAILED, message=reason)
 
     def discover(self, logger: AirbyteLogger, config: Mapping) -> AirbyteCatalog:
         """
@@ -129,16 +142,17 @@ class SourceFile(Source):
         Remote CSV File, returns an Airbyte catalog where each csv file is a stream, and each column is a field.
         """
         config = self._validate_and_transform(config)
-        client = self._get_client(config)
-        name = client.stream_name
-
-        logger.info(f"Discovering schema of {name} at {client.reader.full_url}...")
-        try:
-            streams = list(client.streams)
-        except Exception as err:
-            reason = f"Failed to discover schemas of {name} at {client.reader.full_url}: {repr(err)}\n{traceback.format_exc()}"
-            logger.error(reason)
-            raise err
+        clients = self._get_clients(config)
+        streams = []
+        for client in clients:
+            name = client.stream_name
+            logger.info(f"Discovering schema of {name} at {client.reader.full_url}...")
+            try:
+                streams.append(client.streams)
+            except Exception as err:
+                reason = f"Failed to discover schemas of {name} at {client.reader.full_url}: {repr(err)}\n{traceback.format_exc()}"
+                logger.error(reason)
+                raise err
         return AirbyteCatalog(streams=streams)
 
     def read(
@@ -150,19 +164,20 @@ class SourceFile(Source):
     ) -> Iterator[AirbyteMessage]:
         """Returns a generator of the AirbyteMessages generated by reading the source with the given configuration, catalog, and state."""
         config = self._validate_and_transform(config)
-        client = self._get_client(config)
-        fields = self.selected_fields(catalog)
-        name = client.stream_name
+        clients = self._get_clients(config)
+        for client in clients:
+            fields = self.selected_fields(catalog)
+            name = client.stream_name
 
-        logger.info(f"Reading {name} ({client.reader.full_url})...")
-        try:
-            for row in client.read(fields=fields):
-                record = AirbyteRecordMessage(stream=name, data=row, emitted_at=int(datetime.now().timestamp()) * 1000)
-                yield AirbyteMessage(type=Type.RECORD, record=record)
-        except Exception as err:
-            reason = f"Failed to read data of {name} at {client.reader.full_url}: {repr(err)}\n{traceback.format_exc()}"
-            logger.error(reason)
-            raise err
+            logger.info(f"Reading {name} ({client.reader.full_url})...")
+            try:
+                for row in client.read(fields=fields):
+                    record = AirbyteRecordMessage(stream=name, data=row, emitted_at=int(datetime.now().timestamp()) * 1000)
+                    yield AirbyteMessage(type=Type.RECORD, record=record)
+            except Exception as err:
+                reason = f"Failed to read data of {name} at {client.reader.full_url}: {repr(err)}\n{traceback.format_exc()}"
+                logger.error(reason)
+                raise err
 
     @staticmethod
     def selected_fields(catalog: ConfiguredAirbyteCatalog) -> Iterable:

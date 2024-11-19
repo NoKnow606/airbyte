@@ -403,7 +403,7 @@ class Client:
         return {field: {"type": [fields[field], "null"]} for field in fields}
 
     @property
-    def streams(self) -> Iterable:
+    def streams(self) -> AirbyteStream:
         """Discovers available streams"""
         # TODO handle discovery of directories of multiple files instead
         with self.reader.open() as fp:
@@ -415,4 +415,4 @@ class Client:
                     "type": "object",
                     "properties": self._stream_properties(fp),
                 }
-        yield AirbyteStream(name=self.stream_name, json_schema=json_schema, supported_sync_modes=[SyncMode.full_refresh])
+        return AirbyteStream(name=self.stream_name, json_schema=json_schema, supported_sync_modes=[SyncMode.full_refresh])
